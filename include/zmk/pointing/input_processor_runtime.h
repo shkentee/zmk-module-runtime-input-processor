@@ -16,6 +16,11 @@ enum zmk_input_processor_axis_snap_mode {
     ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_NONE = 0,
     ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X = 1,
     ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y = 2,
+    /* Symmetric dominant-axis lock: dynamically lock to whichever axis
+     * (X or Y) is currently dominant, releasing only when the cross axis
+     * accumulates enough movement to exceed the threshold within timeout.
+     */
+    ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT = 3,
 };
 
 /**

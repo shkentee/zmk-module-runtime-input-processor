@@ -117,6 +117,14 @@ struct runtime_processor_data {
     // Axis snap runtime state
     int16_t axis_snap_cross_axis_accum;     // Accumulated movement on cross axis
     int64_t axis_snap_last_decay_timestamp; // Last time accumulator was decayed
+    // For DOMINANT mode: the axis currently locked as primary.
+    // 0 = unlocked (no dominant axis yet), 1 = X locked, 2 = Y locked.
+    // Ignored when axis_snap_mode is NONE/X/Y.
+    uint8_t axis_snap_dominant_locked_axis;
+    // Accumulator used to decide the dominant axis when still unlocked (mode=DOMINANT).
+    int16_t axis_snap_dominant_x_accum;
+    int16_t axis_snap_dominant_y_accum;
+    int64_t axis_snap_last_event_timestamp; // Last event time for dominant idle reset
 
     // Code mapping settings
     bool xy_to_scroll_enabled;
@@ -368,10 +376,66 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     // Apply axis snapping if configured
     if (data->axis_snap_mode != ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_NONE && event->value != 0) {
         int64_t now = k_uptime_get();
+
+        // For DOMINANT mode, dynamically pick the effective locked axis based
+        // on recent activity. If no axis is locked yet, accumulate per-axis
+        // magnitude and lock to whichever axis first exceeds the threshold.
+        // When the axis has been idle long enough (timeout), unlock and let
+        // the next direction be chosen freely.
+        uint8_t effective_mode = data->axis_snap_mode;
+        bool dominant_undecided = false;
+        if (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT) {
+            // Timeout-based release: if the pointer has been idle for longer
+            // than the configured timeout, release the dominant lock so the
+            // user can switch axes naturally.
+            if (data->axis_snap_last_event_timestamp > 0 &&
+                data->axis_snap_timeout_ms > 0 &&
+                (now - data->axis_snap_last_event_timestamp) >= data->axis_snap_timeout_ms) {
+                data->axis_snap_dominant_locked_axis = 0;
+                data->axis_snap_dominant_x_accum = 0;
+                data->axis_snap_dominant_y_accum = 0;
+                data->axis_snap_cross_axis_accum = 0;
+                LOG_DBG("Axis snap DOMINANT: idle timeout, released lock");
+            }
+            data->axis_snap_last_event_timestamp = now;
+
+            if (data->axis_snap_dominant_locked_axis == 0) {
+                // Still choosing: accumulate magnitude per axis.
+                int16_t abs_v = value < 0 ? -value : value;
+                if (is_x) {
+                    data->axis_snap_dominant_x_accum += abs_v;
+                } else {
+                    data->axis_snap_dominant_y_accum += abs_v;
+                }
+
+                if (data->axis_snap_dominant_x_accum >= data->axis_snap_threshold &&
+                    data->axis_snap_dominant_x_accum >= data->axis_snap_dominant_y_accum) {
+                    data->axis_snap_dominant_locked_axis =
+                        ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X;
+                    data->axis_snap_cross_axis_accum = 0;
+                    LOG_DBG("Axis snap DOMINANT: locked to X");
+                } else if (data->axis_snap_dominant_y_accum >= data->axis_snap_threshold &&
+                           data->axis_snap_dominant_y_accum > data->axis_snap_dominant_x_accum) {
+                    data->axis_snap_dominant_locked_axis =
+                        ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y;
+                    data->axis_snap_cross_axis_accum = 0;
+                    LOG_DBG("Axis snap DOMINANT: locked to Y");
+                } else {
+                    // Not yet locked: let movement pass through this cycle.
+                    dominant_undecided = true;
+                }
+            }
+
+            if (!dominant_undecided) {
+                effective_mode = data->axis_snap_dominant_locked_axis;
+            }
+        }
+
         bool is_snapped_axis =
-            (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X && is_x) ||
-            (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y && !is_x);
-        bool is_cross_axis = !is_snapped_axis;
+            !dominant_undecided &&
+            ((effective_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X && is_x) ||
+             (effective_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y && !is_x));
+        bool is_cross_axis = !dominant_undecided && !is_snapped_axis;
 
         // Decay accumulator over time
         if (data->axis_snap_timeout_ms > 0 && data->axis_snap_last_decay_timestamp > 0) {
@@ -442,6 +506,21 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
                         (data->axis_snap_cross_axis_accum > 0 ? data->axis_snap_threshold
                                                               : -data->axis_snap_threshold) *
                         2;
+                }
+
+                // For DOMINANT mode, switch the locked axis to the new one
+                // instead of just temporarily unsnapping. This gives a
+                // symmetric "whichever axis is active gets priority"
+                // behaviour.
+                if (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT) {
+                    data->axis_snap_dominant_locked_axis =
+                        is_x ? ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X
+                             : ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y;
+                    data->axis_snap_dominant_x_accum = 0;
+                    data->axis_snap_dominant_y_accum = 0;
+                    data->axis_snap_cross_axis_accum = 0;
+                    LOG_DBG("Axis snap DOMINANT: switched lock to %s",
+                            is_x ? "X" : "Y");
                 }
             } else {
                 // Suppress cross-axis movement while locked
@@ -652,6 +731,10 @@ static int runtime_processor_init(const struct device *dev) {
     // Initialize axis snap runtime state
     data->axis_snap_cross_axis_accum = 0;
     data->axis_snap_last_decay_timestamp = 0;
+    data->axis_snap_dominant_locked_axis = 0;
+    data->axis_snap_dominant_x_accum = 0;
+    data->axis_snap_dominant_y_accum = 0;
+    data->axis_snap_last_event_timestamp = 0;
 
     // Initialize code mapping settings from DT defaults
     data->xy_to_scroll_enabled = cfg->initial_xy_to_scroll_enabled;
@@ -836,6 +919,10 @@ void zmk_input_processor_runtime_restore_persistent(const struct device *dev) {
     // Reset snap state when restoring
     data->axis_snap_cross_axis_accum = 0;
     data->axis_snap_last_decay_timestamp = 0;
+    data->axis_snap_dominant_locked_axis = 0;
+    data->axis_snap_dominant_x_accum = 0;
+    data->axis_snap_dominant_y_accum = 0;
+    data->axis_snap_last_event_timestamp = 0;
 
     // Restore axis invert settings
     data->x_invert = data->persistent_x_invert;
@@ -1361,7 +1448,7 @@ int zmk_input_processor_runtime_set_axis_snap_mode(const struct device *dev, uin
         return -EINVAL;
     }
 
-    if (mode > ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y) {
+    if (mode > ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT) {
         return -EINVAL;
     }
 
@@ -1370,6 +1457,10 @@ int zmk_input_processor_runtime_set_axis_snap_mode(const struct device *dev, uin
 
     // Reset snap state when mode changes
     data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_dominant_locked_axis = 0;
+    data->axis_snap_dominant_x_accum = 0;
+    data->axis_snap_dominant_y_accum = 0;
+    data->axis_snap_last_event_timestamp = 0;
 
     if (persistent) {
         data->persistent_axis_snap_mode = mode;
@@ -1448,7 +1539,7 @@ int zmk_input_processor_runtime_set_axis_snap(const struct device *dev, uint8_t 
         return -EINVAL;
     }
 
-    if (mode > ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y) {
+    if (mode > ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT) {
         return -EINVAL;
     }
 
@@ -1459,6 +1550,10 @@ int zmk_input_processor_runtime_set_axis_snap(const struct device *dev, uint8_t 
 
     // Reset snap state when configuration changes
     data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_dominant_locked_axis = 0;
+    data->axis_snap_dominant_x_accum = 0;
+    data->axis_snap_dominant_y_accum = 0;
+    data->axis_snap_last_event_timestamp = 0;
 
     if (persistent) {
         data->persistent_axis_snap_mode = mode;
