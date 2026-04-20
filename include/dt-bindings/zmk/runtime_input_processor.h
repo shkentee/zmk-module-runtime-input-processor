@@ -23,4 +23,7 @@
 /** Snap to Y axis (vertical only) */
 #define AXIS_SNAP_MODE_Y 2
 
+/** Symmetric dominant-axis lock: dynamically lock to whichever axis is dominant */
+#define AXIS_SNAP_MODE_DOMINANT 3
+
 #endif /* ZMK_DT_BINDINGS_INPUT_PROCESSOR_H_ */

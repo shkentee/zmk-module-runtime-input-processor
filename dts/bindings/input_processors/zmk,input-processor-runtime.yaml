@@ -100,7 +100,10 @@ properties:
     type: int
     default: 0
     description: |
-      Axis snapping mode: 0 = none, 1 = snap to X axis, 2 = snap to Y axis.
+      Axis snapping mode: 0 = none, 1 = snap to X axis, 2 = snap to Y axis,
+      3 = dominant (symmetric dynamic lock; whichever axis is currently dominant
+      gets locked, and cross-axis movement is suppressed until threshold is
+      exceeded within timeout).
       When enabled, movement is locked to the selected axis unless threshold is exceeded.
 
   axis-snap-threshold:
