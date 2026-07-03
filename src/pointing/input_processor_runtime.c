@@ -476,58 +476,58 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         bool should_unlock = false;
 
         if (is_cross_axis) {
-            int16_t current_abs_accum = data->axis_snap_cross_axis_accum < 0
-                                            ? -data->axis_snap_cross_axis_accum
-                                            : data->axis_snap_cross_axis_accum;
-            bool is_unsnapped = current_abs_accum >= data->axis_snap_threshold;
-
-            if (is_unsnapped) {
-                // Just increase accumulator when already unsnapped
-                data->axis_snap_cross_axis_accum = current_abs_accum + (value > 0 ? value : -value);
-            } else {
-                // Accumulate normally when snapped (no abs)
-                data->axis_snap_cross_axis_accum += value;
-            }
-            // Reset decay timer on movement
-            data->axis_snap_last_decay_timestamp = now;
-
-            // Check if threshold exceeded (check absolute value)
-            int16_t abs_accum = data->axis_snap_cross_axis_accum < 0
-                                    ? -data->axis_snap_cross_axis_accum
-                                    : data->axis_snap_cross_axis_accum;
-
-            if (abs_accum >= data->axis_snap_threshold) {
-                LOG_DBG("Axis snap: unlocked (threshold=%d exceeded with accum=%d)",
-                        data->axis_snap_threshold, data->axis_snap_cross_axis_accum);
-                // cap the accumulator to twice the threshold so that it decays
-                // under threshold within timeout
-                if (abs_accum > data->axis_snap_threshold * 2) {
-                    data->axis_snap_cross_axis_accum =
-                        (data->axis_snap_cross_axis_accum > 0 ? data->axis_snap_threshold
-                                                              : -data->axis_snap_threshold) *
-                        2;
-                }
-
-                // For DOMINANT mode, switch the locked axis to the new one
-                // instead of just temporarily unsnapping. This gives a
-                // symmetric "whichever axis is active gets priority"
-                // behaviour.
-                if (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT) {
-                    data->axis_snap_dominant_locked_axis =
-                        is_x ? ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X
-                             : ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y;
-                    data->axis_snap_dominant_x_accum = 0;
-                    data->axis_snap_dominant_y_accum = 0;
-                    data->axis_snap_cross_axis_accum = 0;
-                    LOG_DBG("Axis snap DOMINANT: switched lock to %s",
-                            is_x ? "X" : "Y");
-                }
-            } else {
-                // Suppress cross-axis movement while locked
+            if (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT) {
+                // Sticky per-gesture lock: once an axis is locked, the cross axis is
+                // always suppressed. The locked axis is re-chosen only after the
+                // pointer has been idle longer than axis_snap_timeout_ms (handled at
+                // the top of the DOMINANT block). This stops the rapid X<->Y
+                // flip-flopping that made diagonal motion leak through; each scroll
+                // gesture stays purely vertical or purely horizontal.
                 event->value = 0;
-                LOG_DBG("Axis snap: suppressing cross-axis movement (accum=%d, "
-                        "threshold=%d)",
-                        data->axis_snap_cross_axis_accum, data->axis_snap_threshold);
+                LOG_DBG("Axis snap DOMINANT: suppressing cross-axis (locked=%d)",
+                        data->axis_snap_dominant_locked_axis);
+            } else {
+                // Fixed-axis modes (X / Y): break the lock when sustained cross-axis
+                // movement exceeds the threshold within the timeout window.
+                int16_t current_abs_accum = data->axis_snap_cross_axis_accum < 0
+                                                ? -data->axis_snap_cross_axis_accum
+                                                : data->axis_snap_cross_axis_accum;
+                bool is_unsnapped = current_abs_accum >= data->axis_snap_threshold;
+
+                if (is_unsnapped) {
+                    // Just increase accumulator when already unsnapped
+                    data->axis_snap_cross_axis_accum =
+                        current_abs_accum + (value > 0 ? value : -value);
+                } else {
+                    // Accumulate normally when snapped (no abs)
+                    data->axis_snap_cross_axis_accum += value;
+                }
+                // Reset decay timer on movement
+                data->axis_snap_last_decay_timestamp = now;
+
+                // Check if threshold exceeded (check absolute value)
+                int16_t abs_accum = data->axis_snap_cross_axis_accum < 0
+                                        ? -data->axis_snap_cross_axis_accum
+                                        : data->axis_snap_cross_axis_accum;
+
+                if (abs_accum >= data->axis_snap_threshold) {
+                    LOG_DBG("Axis snap: unlocked (threshold=%d exceeded with accum=%d)",
+                            data->axis_snap_threshold, data->axis_snap_cross_axis_accum);
+                    // cap the accumulator to twice the threshold so that it decays
+                    // under threshold within timeout
+                    if (abs_accum > data->axis_snap_threshold * 2) {
+                        data->axis_snap_cross_axis_accum =
+                            (data->axis_snap_cross_axis_accum > 0 ? data->axis_snap_threshold
+                                                                  : -data->axis_snap_threshold) *
+                            2;
+                    }
+                } else {
+                    // Suppress cross-axis movement while locked
+                    event->value = 0;
+                    LOG_DBG("Axis snap: suppressing cross-axis movement (accum=%d, "
+                            "threshold=%d)",
+                            data->axis_snap_cross_axis_accum, data->axis_snap_threshold);
+                }
             }
         }
 
