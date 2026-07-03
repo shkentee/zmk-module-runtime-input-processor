@@ -381,113 +381,45 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     if (data->axis_snap_mode != ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_NONE && event->value != 0) {
         int64_t now = k_uptime_get();
 
-        if (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_DOMINANT) {
-            // Real-time per-event dominant axis (no lock / no hysteresis).
-            //
-            // The trackball emits an X event and a Y event every report. We keep the
-            // latest magnitude of each axis together with the time it last moved, and
-            // pass an axis only when it is the (equal-or-)larger of the two currently
-            // active axes; the weaker axis is zeroed. Motion therefore snaps to
-            // whichever direction dominates *right now* and flips between vertical and
-            // horizontal in real time, while never letting a diagonal component
-            // through within a single report. Ties go to Y (vertical).
-            //
-            // An axis that stopped moving is dropped from the comparison after
-            // AXIS_DOMINANT_STALE_MS so that slow single-axis scrolling is never
-            // blocked by a stale magnitude from the other axis.
-            const int64_t AXIS_DOMINANT_STALE_MS = 50;
-            int16_t mag = value < 0 ? -value : value;
-            int16_t other_mag;
+        // Real-time per-event dominant axis — the only axis-snap logic.
+        //
+        // The trackball emits an X event and a Y event every report. We keep the
+        // latest magnitude of each axis together with the time it last moved, and
+        // pass an axis only when it is the (equal-or-)larger of the two currently
+        // active axes; the weaker axis is zeroed. Motion therefore snaps to
+        // whichever direction dominates *right now* and flips between vertical and
+        // horizontal in real time, while never letting a diagonal component through
+        // within a single report. Ties go to Y (vertical).
+        //
+        // An axis that stopped moving is dropped from the comparison after
+        // AXIS_DOMINANT_STALE_MS so that slow single-axis scrolling is never blocked
+        // by a stale magnitude from the other axis.
+        const int64_t AXIS_DOMINANT_STALE_MS = 50;
+        int16_t mag = value < 0 ? -value : value;
+        int16_t other_mag;
 
-            if (is_x) {
-                other_mag = (data->axis_snap_dom_y_ts > 0 &&
-                             (now - data->axis_snap_dom_y_ts) <= AXIS_DOMINANT_STALE_MS)
-                                ? data->axis_snap_dominant_y_accum
-                                : 0;
-                data->axis_snap_dominant_x_accum = mag;
-                data->axis_snap_dom_x_ts = now;
-            } else {
-                other_mag = (data->axis_snap_dom_x_ts > 0 &&
-                             (now - data->axis_snap_dom_x_ts) <= AXIS_DOMINANT_STALE_MS)
-                                ? data->axis_snap_dominant_x_accum
-                                : 0;
-                data->axis_snap_dominant_y_accum = mag;
-                data->axis_snap_dom_y_ts = now;
-            }
-
-            // Suppress the weaker axis. On a tie, keep Y (vertical) and drop X so that
-            // exact 45-degree motion still resolves to a single axis.
-            bool suppress = is_x ? (mag <= other_mag) : (mag < other_mag);
-            if (suppress) {
-                event->value = 0;
-                LOG_DBG("Axis snap INSTANT: suppress %s (mag=%d other=%d)", is_x ? "X" : "Y",
-                        mag, other_mag);
-            }
+        if (is_x) {
+            other_mag = (data->axis_snap_dom_y_ts > 0 &&
+                         (now - data->axis_snap_dom_y_ts) <= AXIS_DOMINANT_STALE_MS)
+                            ? data->axis_snap_dominant_y_accum
+                            : 0;
+            data->axis_snap_dominant_x_accum = mag;
+            data->axis_snap_dom_x_ts = now;
         } else {
-            // Fixed-axis modes (X=1 / Y=2): lock to the configured axis and break only
-            // when sustained cross-axis movement exceeds the threshold within timeout.
-            bool is_snapped_axis =
-                (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X && is_x) ||
-                (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y && !is_x);
-            bool is_cross_axis = !is_snapped_axis;
+            other_mag = (data->axis_snap_dom_x_ts > 0 &&
+                         (now - data->axis_snap_dom_x_ts) <= AXIS_DOMINANT_STALE_MS)
+                            ? data->axis_snap_dominant_x_accum
+                            : 0;
+            data->axis_snap_dominant_y_accum = mag;
+            data->axis_snap_dom_y_ts = now;
+        }
 
-            // Decay cross-axis accumulator over time
-            if (data->axis_snap_timeout_ms > 0 && data->axis_snap_last_decay_timestamp > 0) {
-                int64_t elapsed = now - data->axis_snap_last_decay_timestamp;
-                if (elapsed > 0) {
-                    int64_t decay_periods = elapsed / 50;
-                    if (decay_periods > 0) {
-                        int16_t decay_per_50ms =
-                            data->axis_snap_threshold / (data->axis_snap_timeout_ms / 50);
-                        if (decay_per_50ms < 1) {
-                            decay_per_50ms = 1;
-                        }
-                        int16_t total_decay = decay_per_50ms * decay_periods;
-                        if (data->axis_snap_cross_axis_accum > 0) {
-                            data->axis_snap_cross_axis_accum -= total_decay;
-                            if (data->axis_snap_cross_axis_accum < 0) {
-                                data->axis_snap_cross_axis_accum = 0;
-                            }
-                        } else if (data->axis_snap_cross_axis_accum < 0) {
-                            data->axis_snap_cross_axis_accum += total_decay;
-                            if (data->axis_snap_cross_axis_accum > 0) {
-                                data->axis_snap_cross_axis_accum = 0;
-                            }
-                        }
-                        data->axis_snap_last_decay_timestamp = now;
-                    }
-                }
-            }
-
-            if (is_cross_axis) {
-                int16_t current_abs_accum = data->axis_snap_cross_axis_accum < 0
-                                                ? -data->axis_snap_cross_axis_accum
-                                                : data->axis_snap_cross_axis_accum;
-                bool is_unsnapped = current_abs_accum >= data->axis_snap_threshold;
-
-                if (is_unsnapped) {
-                    data->axis_snap_cross_axis_accum =
-                        current_abs_accum + (value > 0 ? value : -value);
-                } else {
-                    data->axis_snap_cross_axis_accum += value;
-                }
-                data->axis_snap_last_decay_timestamp = now;
-
-                int16_t abs_accum = data->axis_snap_cross_axis_accum < 0
-                                        ? -data->axis_snap_cross_axis_accum
-                                        : data->axis_snap_cross_axis_accum;
-
-                if (abs_accum >= data->axis_snap_threshold) {
-                    if (abs_accum > data->axis_snap_threshold * 2) {
-                        data->axis_snap_cross_axis_accum =
-                            (data->axis_snap_cross_axis_accum > 0 ? data->axis_snap_threshold
-                                                                  : -data->axis_snap_threshold) *
-                            2;
-                    }
-                } else {
-                    event->value = 0;
-                }
-            }
+        // Suppress the weaker axis. On a tie, keep Y (vertical) and drop X so that
+        // exact 45-degree motion still resolves to a single axis.
+        bool suppress = is_x ? (mag <= other_mag) : (mag < other_mag);
+        if (suppress) {
+            event->value = 0;
+            LOG_DBG("Axis snap: suppress %s (mag=%d other=%d)", is_x ? "X" : "Y", mag, other_mag);
         }
 
         // Update value after snap processing
